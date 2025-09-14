@@ -1,0 +1,32 @@
+# Core GUI Framework
+PyQt6==6.6.1
+
+# Media Download and Processing
+yt-dlp==2023.12.30
+ffmpeg-python==0.2.0
+
+# Image Processing
+Pillow==10.1.0
+
+# HTTP Requests
+requests==2.31.0
+
+# Audio Processing and Metadata
+mutagen==1.47.0
+eyed3==0.9.7
+
+# Utility Libraries
+python-dateutil==2.8.2
+psutil==5.9.6
+
+# Optional: For better proxy support
+PySocks==1.7.1
+
+# Optional: For GUI themes and styling
+darkdetect==0.8.0
+
+# Optional: For better error handling and logging
+colorlog==6.7.0
+
+# Optional: For system notifications
+plyer==2.1.0
