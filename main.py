@@ -1,1160 +1,1269 @@
-import sys
-import os
-import json
-import sqlite3
+#!/usr/bin/env python3
+"""
+Social Media Downloader Desktop Application
+A modern, feature-rich desktop application for downloading social media content.
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import customtkinter as ctk
 import threading
-import asyncio
+import json
+import os
+import sys
+import subprocess
+import urllib.parse
 import re
 from pathlib import Path
+import time
 from datetime import datetime
-from typing import Dict, List, Optional
-import urllib.parse
+import queue
+from PIL import Image, ImageTk
+import requests
+from io import BytesIO
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox, 
-    QProgressBar, QTextEdit, QTabWidget, QListWidget, QListWidgetItem,
-    QFileDialog, QMessageBox, QFrame, QScrollArea, QGroupBox,
-    QCheckBox, QSlider, QSpinBox, QTableWidget, QTableWidgetItem,
-    QSplitter, QSystemTrayIcon, QMenu, QDialog, QDialogButtonBox
-)
-from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QSettings, QSize, QRect,
-    QPropertyAnimation, QEasingCurve, QParallelAnimationGroup
-)
-from PyQt6.QtGui import (
-    QFont, QPixmap, QIcon, QPalette, QColor, QLinearGradient,
-    QBrush, QPainter, QAction, QClipboard
-)
+# Set appearance mode and color theme
+ctk.set_appearance_mode("system")
+ctk.set_default_color_theme("blue")
 
-# Import the fixed download manager
-from download_manager import DownloadManager, DownloadItem, DownloadStatus, MediaExtractor
-
-# You'll need to install these packages:
-# pip install PyQt6 yt-dlp requests pillow
-
-try:
-    import yt_dlp
-    import requests
-    from PIL import Image
-except ImportError:
-    print("Please install required packages: pip install yt-dlp requests pillow")
-    sys.exit(1)
-
-
-class ModernButton(QPushButton):
-    """Custom modern button with hover effects"""
-    def __init__(self, text="", parent=None):
-        super().__init__(text, parent)
-        self.setFixedHeight(40)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setup_style()
+class Config:
+    """Application configuration manager"""
+    def __init__(self):
+        self.config_dir = Path.home() / ".social_downloader"
+        self.config_file = self.config_dir / "config.json"
+        self.config_dir.mkdir(exist_ok=True)
+        
+        self.default_config = {
+            "theme": "system",
+            "download_path": str(Path.home() / "Downloads" / "SocialDownloader"),
+            "default_video_quality": "720p",
+            "default_audio_quality": "192kbps",
+            "max_concurrent": 3,
+            "naming_pattern": "{title}",
+            "create_subfolders": True,
+            "platforms": {
+                "youtube": True,
+                "instagram": True,
+                "tiktok": True,
+                "twitter": True,
+                "facebook": True
+            }
+        }
+        
+        self.config = self.load_config()
     
-    def setup_style(self):
-        self.setStyleSheet("""
-            ModernButton {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #4A90E2, stop:1 #357ABD);
-                border: none;
-                border-radius: 8px;
-                color: white;
-                font-weight: bold;
-                font-size: 14px;
-                padding: 8px 16px;
-            }
-            ModernButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #5BA0F2, stop:1 #4A8ACD);
-            }
-            ModernButton:pressed {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #357ABD, stop:1 #2E6BA8);
-            }
-            ModernButton:disabled {
-                background: #CCCCCC;
-                color: #888888;
-            }
-        """)
-
-
-class ModernLineEdit(QLineEdit):
-    """Custom modern line edit with styling"""
-    def __init__(self, placeholder="", parent=None):
-        super().__init__(parent)
-        self.setPlaceholderText(placeholder)
-        self.setFixedHeight(40)
-        self.setup_style()
-    
-    def setup_style(self):
-        self.setStyleSheet("""
-            ModernLineEdit {
-                border: 2px solid #E0E0E0;
-                border-radius: 8px;
-                padding: 8px 12px;
-                font-size: 14px;
-                background: white;
-            }
-            ModernLineEdit:focus {
-                border-color: #4A90E2;
-            }
-            ModernLineEdit:hover {
-                border-color: #B0B0B0;
-            }
-        """)
-
-
-class DownloadWorker(QThread):
-    """Worker thread for downloading content - simplified version"""
-    progress = pyqtSignal(int)  # Progress percentage
-    status = pyqtSignal(str)    # Status message
-    finished = pyqtSignal(str)  # Finished with file path
-    error = pyqtSignal(str)     # Error message
-    
-    def __init__(self, url, output_path, format_info):
-        super().__init__()
-        self.url = url
-        self.output_path = output_path
-        self.format_info = format_info
-        self.is_cancelled = False
-    
-    def run(self):
+    def load_config(self):
+        """Load configuration from file"""
         try:
-            self.status.emit("Preparing download...")
-            
-            # Validate URL
-            if not self.is_valid_url(self.url):
-                self.error.emit("Invalid URL format")
-                return
-            
-            # Configure yt-dlp options
-            ydl_opts = {
-                'outtmpl': os.path.join(self.output_path, '%(title)s.%(ext)s'),
-                'progress_hooks': [self.progress_hook],
-                'socket_timeout': 60,
-                'retries': 3,
-            }
-            
-            # Set format based on user selection
-            if self.format_info['type'] == 'video':
-                if self.format_info['quality'] == 'Best Available':
-                    ydl_opts['format'] = 'best[ext=mp4]/best'
-                else:
-                    # Extract resolution number
-                    resolution = ''.join(filter(str.isdigit, self.format_info['quality']))
-                    if resolution:
-                        ydl_opts['format'] = f'best[height<={resolution}][ext=mp4]/best[height<={resolution}]/best'
-                    else:
-                        ydl_opts['format'] = 'best[ext=mp4]/best'
-                        
-            elif self.format_info['type'] == 'audio':
-                ydl_opts['format'] = 'bestaudio/best'
-                # Extract bitrate number
-                bitrate = ''.join(filter(str.isdigit, self.format_info.get('quality', '320')))
-                if not bitrate:
-                    bitrate = '320'
-                    
-                ydl_opts['postprocessors'] = [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': bitrate,
-                }]
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                if self.is_cancelled:
-                    return
-                
-                self.status.emit("Downloading...")
-                ydl.download([self.url])
-                
-            if not self.is_cancelled:
-                self.finished.emit("Download completed successfully!")
-            
-        except yt_dlp.DownloadError as e:
-            if not self.is_cancelled:
-                self.error.emit(f"Download failed: {str(e)}")
+            if self.config_file.exists():
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                # Merge with defaults for any missing keys
+                for key, value in self.default_config.items():
+                    if key not in config:
+                        config[key] = value
+                return config
+            else:
+                return self.default_config.copy()
         except Exception as e:
-            if not self.is_cancelled:
-                self.error.emit(f"Download failed: {str(e)}")
+            print(f"Error loading config: {e}")
+            return self.default_config.copy()
     
-    def is_valid_url(self, url):
-        """Basic URL validation"""
+    def save_config(self):
+        """Save configuration to file"""
         try:
-            result = urllib.parse.urlparse(url)
-            return all([result.scheme, result.netloc])
-        except Exception:
+            with open(self.config_file, 'w') as f:
+                json.dump(self.config, f, indent=4)
+        except Exception as e:
+            print(f"Error saving config: {e}")
+
+class DownloadItem:
+    """Represents a download item"""
+    def __init__(self, url, title="", platform="", thumbnail_url="", duration="", quality="720p", format_type="mp4"):
+        self.url = url
+        self.title = title
+        self.platform = platform
+        self.thumbnail_url = thumbnail_url
+        self.duration = duration
+        self.quality = quality
+        self.format_type = format_type
+        self.status = "pending"  # pending, downloading, completed, error
+        self.progress = 0
+        self.file_path = ""
+        self.error_message = ""
+
+class YouTubeDLWrapper:
+    """Wrapper for yt-dlp functionality"""
+    def __init__(self):
+        self.is_available = self.check_ytdlp()
+    
+    def check_ytdlp(self):
+        """Check if yt-dlp is available"""
+        try:
+            result = subprocess.run(['yt-dlp', '--version'], capture_output=True, text=True)
+            return result.returncode == 0
+        except FileNotFoundError:
             return False
     
-    def progress_hook(self, d):
-        """Handle download progress"""
-        if self.is_cancelled:
-            raise yt_dlp.DownloadError("Download cancelled")
-            
-        if d['status'] == 'downloading':
-            try:
-                if 'total_bytes' in d and d['total_bytes']:
-                    percent = int(d['downloaded_bytes'] * 100 / d['total_bytes'])
-                    self.progress.emit(percent)
-                elif 'total_bytes_estimate' in d and d['total_bytes_estimate']:
-                    percent = int(d['downloaded_bytes'] * 100 / d['total_bytes_estimate'])
-                    self.progress.emit(percent)
-                elif '_percent_str' in d:
-                    percent_str = d['_percent_str'].strip().replace('%', '')
-                    try:
-                        percent = int(float(percent_str))
-                        self.progress.emit(percent)
-                    except (ValueError, TypeError):
-                        pass
-            except (KeyError, TypeError, ZeroDivisionError):
-                pass
-    
-    def cancel(self):
-        self.is_cancelled = True
-
-
-class MediaInfo(QWidget):
-    """Widget to display media information and preview"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setup_ui()
-        self.media_extractor = MediaExtractor()
-        self.media_extractor.info_extracted.connect(self.update_info)
-        self.media_extractor.error_occurred.connect(self.show_error)
-    
-    def setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(15)
+    def get_video_info(self, url):
+        """Extract video information"""
+        if not self.is_available:
+            raise Exception("yt-dlp not found. Please install yt-dlp.")
         
-        # Title
-        self.title_label = QLabel("Media Information")
-        self.title_label.setFont(QFont("Arial", 16, QFont.Weight.Bold))
-        layout.addWidget(self.title_label)
-        
-        # Info container
-        info_frame = QFrame()
-        info_frame.setFrameStyle(QFrame.Shape.StyledPanel)
-        info_frame.setStyleSheet("""
-            QFrame {
-                background: white;
-                border: 1px solid #E0E0E0;
-                border-radius: 8px;
-                padding: 15px;
-            }
-        """)
-        info_layout = QVBoxLayout(info_frame)
-        
-        # Thumbnail
-        self.thumbnail_label = QLabel()
-        self.thumbnail_label.setFixedSize(200, 150)
-        self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.thumbnail_label.setStyleSheet("""
-            QLabel {
-                border: 2px dashed #CCCCCC;
-                border-radius: 4px;
-                background: #F8F8F8;
-            }
-        """)
-        self.thumbnail_label.setText("No Preview")
-        info_layout.addWidget(self.thumbnail_label)
-        
-        # Details
-        self.details_text = QTextEdit()
-        self.details_text.setMaximumHeight(120)
-        self.details_text.setReadOnly(True)
-        info_layout.addWidget(self.details_text)
-        
-        layout.addWidget(info_frame)
-        layout.addStretch()
-    
-    def extract_info(self, url):
-        """Extract information from URL"""
-        self.details_text.setText("Extracting information...")
-        self.media_extractor.extract_info(url)
-    
-    def update_info(self, info_dict):
-        """Update the media information display"""
-        self.details_text.clear()
-        details = []
-        
-        if 'title' in info_dict:
-            details.append(f"Title: {info_dict['title']}")
-        if 'uploader' in info_dict:
-            details.append(f"Channel: {info_dict['uploader']}")
-        if 'duration' in info_dict and info_dict['duration']:
-            duration = info_dict['duration']
-            minutes, seconds = divmod(duration, 60)
-            details.append(f"Duration: {minutes}:{seconds:02d}")
-        if 'view_count' in info_dict and info_dict['view_count']:
-            details.append(f"Views: {info_dict['view_count']:,}")
-        if 'platform' in info_dict:
-            details.append(f"Platform: {info_dict['platform']}")
-        
-        self.details_text.setText('\n'.join(details))
-    
-    def show_error(self, error_message):
-        """Show error message"""
-        self.details_text.setText(f"Error: {error_message}")
-
-
-class SettingsDialog(QDialog):
-    """Settings dialog for application preferences"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Settings")
-        self.setFixedSize(500, 400)
-        self.setup_ui()
-        self.load_settings()
-    
-    def setup_ui(self):
-        layout = QVBoxLayout(self)
-        
-        # Tab widget for different setting categories
-        tabs = QTabWidget()
-        
-        # General settings
-        general_tab = QWidget()
-        general_layout = QVBoxLayout(general_tab)
-        
-        # Default download path
-        path_group = QGroupBox("Download Location")
-        path_layout = QHBoxLayout(path_group)
-        self.path_edit = ModernLineEdit()
-        path_browse_btn = ModernButton("Browse")
-        path_browse_btn.clicked.connect(self.browse_download_path)
-        path_layout.addWidget(self.path_edit)
-        path_layout.addWidget(path_browse_btn)
-        general_layout.addWidget(path_group)
-        
-        # Theme settings
-        theme_group = QGroupBox("Appearance")
-        theme_layout = QVBoxLayout(theme_group)
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["Light", "Dark", "Auto"])
-        theme_layout.addWidget(QLabel("Theme:"))
-        theme_layout.addWidget(self.theme_combo)
-        general_layout.addWidget(theme_group)
-        
-        general_layout.addStretch()
-        tabs.addTab(general_tab, "General")
-        
-        # Download settings
-        download_tab = QWidget()
-        download_layout = QVBoxLayout(download_tab)
-        
-        # Default quality settings
-        quality_group = QGroupBox("Default Quality")
-        quality_layout = QGridLayout(quality_group)
-        
-        quality_layout.addWidget(QLabel("Video Quality:"), 0, 0)
-        self.video_quality_combo = QComboBox()
-        self.video_quality_combo.addItems(["720p", "1080p", "480p", "360p", "Best Available"])
-        quality_layout.addWidget(self.video_quality_combo, 0, 1)
-        
-        quality_layout.addWidget(QLabel("Audio Quality:"), 1, 0)
-        self.audio_quality_combo = QComboBox()
-        self.audio_quality_combo.addItems(["320 kbps", "192 kbps", "128 kbps", "64 kbps"])
-        quality_layout.addWidget(self.audio_quality_combo, 1, 1)
-        
-        download_layout.addWidget(quality_group)
-        download_layout.addStretch()
-        tabs.addTab(download_tab, "Downloads")
-        
-        layout.addWidget(tabs)
-        
-        # Dialog buttons
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | 
-            QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-    
-    def browse_download_path(self):
-        path = QFileDialog.getExistingDirectory(self, "Select Download Directory")
-        if path:
-            self.path_edit.setText(path)
-    
-    def load_settings(self):
-        settings = QSettings("SocialMediaDownloader", "Settings")
-        download_path = settings.value("download_path", str(Path.home() / "Downloads"))
-        self.path_edit.setText(download_path)
-        
-        theme = settings.value("theme", "Light")
-        self.theme_combo.setCurrentText(theme)
-        
-        video_quality = settings.value("video_quality", "720p")
-        self.video_quality_combo.setCurrentText(video_quality)
-        
-        audio_quality = settings.value("audio_quality", "320 kbps")
-        self.audio_quality_combo.setCurrentText(audio_quality)
-    
-    def save_settings(self):
-        settings = QSettings("SocialMediaDownloader", "Settings")
-        settings.setValue("download_path", self.path_edit.text())
-        settings.setValue("theme", self.theme_combo.currentText())
-        settings.setValue("video_quality", self.video_quality_combo.currentText())
-        settings.setValue("audio_quality", self.audio_quality_combo.currentText())
-
-
-class SocialMediaDownloader(QMainWindow):
-    """Main application window"""
-    def __init__(self):
-        super().__init__()
-        self.current_worker = None
-        self.download_history = []
-        self.setup_database()
-        self.setup_ui()
-        self.load_settings()
-        self.setup_system_tray()
-        
-        # Initialize download manager
-        self.download_manager = DownloadManager()
-        self.download_manager.download_completed.connect(self.on_download_completed)
-        self.download_manager.download_failed.connect(self.on_download_failed)
-        self.download_manager.download_updated.connect(self.on_download_updated)
-    
-    def setup_database(self):
-        """Initialize SQLite database for storing history and settings"""
         try:
-            db_path = Path.home() / ".social_downloader" / "history.db"
-            db_path.parent.mkdir(exist_ok=True)
+            cmd = [
+                'yt-dlp',
+                '--dump-json',
+                '--no-download',
+                url
+            ]
             
-            self.conn = sqlite3.connect(str(db_path))
-            cursor = self.conn.cursor()
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS downloads (
-                    id INTEGER PRIMARY KEY,
-                    url TEXT,
-                    title TEXT,
-                    file_path TEXT,
-                    download_date TEXT,
-                    file_size INTEGER,
-                    format_type TEXT
-                )
-            ''')
-            self.conn.commit()
+            if result.returncode != 0:
+                raise Exception(f"Failed to get video info: {result.stderr}")
+            
+            info = json.loads(result.stdout)
+            
+            # Extract relevant information
+            return {
+                'title': info.get('title', 'Unknown Title'),
+                'platform': info.get('extractor_key', 'Unknown'),
+                'thumbnail': info.get('thumbnail', ''),
+                'duration': self.format_duration(info.get('duration', 0)),
+                'formats': self.extract_formats(info.get('formats', []))
+            }
+        
+        except subprocess.TimeoutExpired:
+            raise Exception("Request timed out")
+        except json.JSONDecodeError:
+            raise Exception("Invalid response from yt-dlp")
         except Exception as e:
-            print(f"Database setup error: {e}")
-            # Fallback to in-memory database
-            self.conn = sqlite3.connect(":memory:")
-            self.setup_database()
+            raise Exception(f"Error getting video info: {str(e)}")
+    
+    def format_duration(self, duration):
+        """Format duration in seconds to MM:SS or HH:MM:SS"""
+        if not duration:
+            return "N/A"
+        
+        hours = int(duration // 3600)
+        minutes = int((duration % 3600) // 60)
+        seconds = int(duration % 60)
+        
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        else:
+            return f"{minutes:02d}:{seconds:02d}"
+    
+    def extract_formats(self, formats):
+        """Extract available video formats"""
+        video_formats = []
+        audio_formats = []
+        
+        for fmt in formats:
+            if fmt.get('vcodec') != 'none' and fmt.get('height'):
+                quality = f"{fmt['height']}p"
+                if quality not in [f['quality'] for f in video_formats]:
+                    video_formats.append({
+                        'quality': quality,
+                        'format_id': fmt['format_id']
+                    })
+            
+            if fmt.get('acodec') != 'none' and not fmt.get('height'):
+                bitrate = fmt.get('abr', 'Unknown')
+                audio_formats.append({
+                    'quality': f"{bitrate}kbps" if bitrate != 'Unknown' else 'Unknown',
+                    'format_id': fmt['format_id']
+                })
+        
+        # Sort by quality
+        video_formats.sort(key=lambda x: int(x['quality'][:-1]), reverse=True)
+        
+        return {
+            'video': video_formats,
+            'audio': audio_formats
+        }
+
+class ThumbnailCache:
+    """Cache for thumbnail images"""
+    def __init__(self):
+        self.cache = {}
+        self.cache_dir = Path.home() / ".social_downloader" / "thumbnails"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    def get_thumbnail(self, url, size=(120, 90)):
+        """Get thumbnail image, cached"""
+        if url in self.cache:
+            return self.cache[url]
+        
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            
+            image = Image.open(BytesIO(response.content))
+            image.thumbnail(size, Image.Resampling.LANCZOS)
+            
+            # Convert to PhotoImage for tkinter
+            photo = ImageTk.PhotoImage(image)
+            self.cache[url] = photo
+            
+            return photo
+        
+        except Exception as e:
+            print(f"Error loading thumbnail: {e}")
+            return None
+
+class SocialMediaDownloader:
+    """Main application class"""
+    
+    def __init__(self):
+        self.config = Config()
+        self.ytdl = YouTubeDLWrapper()
+        self.thumbnail_cache = ThumbnailCache()
+        self.download_queue = queue.Queue()
+        self.active_downloads = {}
+        self.download_items = []
+        
+        # Create main window
+        self.root = ctk.CTk()
+        self.root.title("Social Media Downloader")
+        self.root.geometry("900x700")
+        self.root.minsize(800, 600)
+        
+        # Set theme
+        ctk.set_appearance_mode(self.config.config["theme"])
+        
+        self.setup_ui()
+        self.setup_styles()
+        
+        # Start download worker thread
+        self.worker_thread = threading.Thread(target=self.download_worker, daemon=True)
+        self.worker_thread.start()
+        
+        # Bind paste event
+        self.root.bind('<Control-v>', self.paste_url)
+    
+    def setup_styles(self):
+        """Setup custom styles for modern UI"""
+        # Configure colors for glassmorphism effect
+        self.colors = {
+            'bg_primary': ("#f0f0f0", "#1a1a1a"),
+            'bg_secondary': ("#ffffff", "#2b2b2b"),
+            'bg_accent': ("#e8e8e8", "#3d3d3d"),
+            'text_primary': ("#000000", "#ffffff"),
+            'text_secondary': ("#666666", "#cccccc"),
+            'accent': ("#007acc", "#4da6ff"),
+            'success': ("#28a745", "#20c997"),
+            'warning': ("#ffc107", "#ffc107"),
+            'error': ("#dc3545", "#e74c3c")
+        }
     
     def setup_ui(self):
-        """Setup the main user interface"""
-        self.setWindowTitle("Social Media Downloader")
-        self.setMinimumSize(1000, 700)
-        self.center_window()
+        """Setup the user interface"""
+        # Configure grid weights
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(2, weight=1)
         
-        # Central widget
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        # Header frame
+        self.create_header()
         
-        # Main layout
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setSpacing(20)
+        # URL input frame
+        self.create_url_input()
         
-        # Left panel
-        left_panel = self.create_left_panel()
-        main_layout.addWidget(left_panel, 2)
+        # Main content area
+        self.create_main_content()
         
-        # Right panel
-        right_panel = self.create_right_panel()
-        main_layout.addWidget(right_panel, 1)
+        # Action buttons
+        self.create_action_buttons()
         
-        # Setup menu bar
-        self.setup_menu_bar()
-        
-        # Setup status bar
-        self.statusBar().showMessage("Ready to download")
-        
-        # Apply modern styling
-        self.apply_modern_style()
+        # Status bar
+        self.create_status_bar()
     
-    def create_left_panel(self):
-        """Create the main download interface panel"""
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setSpacing(20)
+    def create_header(self):
+        """Create application header"""
+        header_frame = ctk.CTkFrame(self.root, height=60, corner_radius=0)
+        header_frame.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+        header_frame.grid_columnconfigure(1, weight=1)
         
-        # Header
-        header_label = QLabel("Social Media Downloader")
-        header_label.setFont(QFont("Arial", 24, QFont.Weight.Bold))
-        header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(header_label)
+        # App title
+        title_label = ctk.CTkLabel(
+            header_frame,
+            text="🎬 Social Media Downloader",
+            font=ctk.CTkFont(size=20, weight="bold")
+        )
+        title_label.grid(row=0, column=0, padx=20, pady=15, sticky="w")
         
-        # URL input section
-        url_group = QGroupBox("Enter URL")
-        url_layout = QVBoxLayout(url_group)
+        # Header buttons
+        button_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        button_frame.grid(row=0, column=2, padx=20, pady=10, sticky="e")
         
-        # URL input with paste button
-        url_input_layout = QHBoxLayout()
-        self.url_input = ModernLineEdit("Paste your URL here...")
-        self.url_input.textChanged.connect(self.on_url_changed)
+        # Theme toggle button
+        self.theme_button = ctk.CTkButton(
+            button_frame,
+            text="🌓",
+            width=40,
+            height=32,
+            font=ctk.CTkFont(size=16),
+            command=self.toggle_theme
+        )
+        self.theme_button.grid(row=0, column=0, padx=(0, 10))
         
-        paste_btn = ModernButton("Paste")
-        paste_btn.setFixedWidth(80)
-        paste_btn.clicked.connect(self.paste_from_clipboard)
-        
-        url_input_layout.addWidget(self.url_input)
-        url_input_layout.addWidget(paste_btn)
-        url_layout.addLayout(url_input_layout)
-        
-        # Format selection
-        format_layout = QHBoxLayout()
-        
-        # Type selection
-        self.type_combo = QComboBox()
-        self.type_combo.addItems(["Video", "Audio", "Auto-detect"])
-        self.type_combo.currentTextChanged.connect(self.on_type_changed)
-        
-        # Quality selection
-        self.quality_combo = QComboBox()
-        self.update_quality_options("Video")
-        
-        format_layout.addWidget(QLabel("Type:"))
-        format_layout.addWidget(self.type_combo)
-        format_layout.addWidget(QLabel("Quality:"))
-        format_layout.addWidget(self.quality_combo)
-        url_layout.addLayout(format_layout)
-        
-        layout.addWidget(url_group)
-        
-        # Download section
-        download_group = QGroupBox("Download")
-        download_layout = QVBoxLayout(download_group)
-        
-        # Download path
-        path_layout = QHBoxLayout()
-        self.path_label = QLabel("Downloads")
-        path_browse_btn = ModernButton("Change Location")
-        path_browse_btn.clicked.connect(self.browse_download_location)
-        path_layout.addWidget(QLabel("Save to:"))
-        path_layout.addWidget(self.path_label)
-        path_layout.addStretch()
-        path_layout.addWidget(path_browse_btn)
-        download_layout.addLayout(path_layout)
-        
-        # Progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        download_layout.addWidget(self.progress_bar)
-        
-        # Download button
-        self.download_btn = ModernButton("Download")
-        self.download_btn.setFixedHeight(50)
-        self.download_btn.clicked.connect(self.start_download)
-        self.download_btn.setEnabled(False)
-        download_layout.addWidget(self.download_btn)
-        
-        layout.addWidget(download_group)
-        
-        # Download queue/batch section
-        queue_group = QGroupBox("Batch Downloads")
-        queue_layout = QVBoxLayout(queue_group)
-        
-        self.queue_list = QListWidget()
-        self.queue_list.setMaximumHeight(150)
-        queue_layout.addWidget(self.queue_list)
-        
-        queue_btn_layout = QHBoxLayout()
-        add_to_queue_btn = ModernButton("Add to Queue")
-        add_to_queue_btn.clicked.connect(self.add_to_queue)
-        clear_queue_btn = ModernButton("Clear Queue")
-        clear_queue_btn.clicked.connect(self.clear_queue)
-        
-        queue_btn_layout.addWidget(add_to_queue_btn)
-        queue_btn_layout.addWidget(clear_queue_btn)
-        queue_layout.addLayout(queue_btn_layout)
-        
-        layout.addWidget(queue_group)
-        layout.addStretch()
-        
-        return panel
+        # Settings button
+        settings_button = ctk.CTkButton(
+            button_frame,
+            text="⚙️",
+            width=40,
+            height=32,
+            font=ctk.CTkFont(size=16),
+            command=self.open_settings
+        )
+        settings_button.grid(row=0, column=1)
     
-    def create_right_panel(self):
-        """Create the information and history panel"""
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
+    def create_url_input(self):
+        """Create URL input section"""
+        url_frame = ctk.CTkFrame(self.root)
+        url_frame.grid(row=1, column=0, sticky="ew", padx=20, pady=(10, 0))
+        url_frame.grid_columnconfigure(0, weight=1)
         
-        # Tab widget for different views
-        self.info_tabs = QTabWidget()
+        # URL input
+        url_input_frame = ctk.CTkFrame(url_frame, fg_color="transparent")
+        url_input_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=15)
+        url_input_frame.grid_columnconfigure(0, weight=1)
         
-        # Media info tab
-        self.media_info = MediaInfo()
-        self.info_tabs.addTab(self.media_info, "Media Info")
+        url_label = ctk.CTkLabel(url_input_frame, text="URL:", font=ctk.CTkFont(size=14, weight="bold"))
+        url_label.grid(row=0, column=0, sticky="w", pady=(0, 5))
+        
+        input_frame = ctk.CTkFrame(url_input_frame, fg_color="transparent")
+        input_frame.grid(row=1, column=0, sticky="ew")
+        input_frame.grid_columnconfigure(0, weight=1)
+        
+        self.url_entry = ctk.CTkEntry(
+            input_frame,
+            placeholder_text="Paste your social media URL here...",
+            height=40,
+            font=ctk.CTkFont(size=12)
+        )
+        self.url_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.url_entry.bind('<Return>', lambda e: self.analyze_url())
+        
+        # Paste button
+        paste_button = ctk.CTkButton(
+            input_frame,
+            text="📋 Paste",
+            width=80,
+            height=40,
+            command=self.paste_url
+        )
+        paste_button.grid(row=0, column=1, padx=(0, 10))
+        
+        # Analyze button
+        self.analyze_button = ctk.CTkButton(
+            input_frame,
+            text="🔍 Analyze",
+            width=100,
+            height=40,
+            command=self.analyze_url
+        )
+        self.analyze_button.grid(row=0, column=2)
+    
+    def create_main_content(self):
+        """Create main content area"""
+        # Create notebook for tabs
+        self.notebook = ctk.CTkTabview(self.root)
+        self.notebook.grid(row=2, column=0, sticky="nsew", padx=20, pady=10)
+        
+        # Preview tab
+        self.preview_tab = self.notebook.add("Preview & Download")
+        self.create_preview_section()
+        
+        # Queue tab
+        self.queue_tab = self.notebook.add("Download Queue")
+        self.create_queue_section()
         
         # History tab
-        history_tab = QWidget()
-        history_layout = QVBoxLayout(history_tab)
-        
-        self.history_table = QTableWidget()
-        self.history_table.setColumnCount(4)
-        self.history_table.setHorizontalHeaderLabels(["Title", "Type", "Date", "Size"])
-        self.load_download_history()
-        history_layout.addWidget(self.history_table)
-        
-        self.info_tabs.addTab(history_tab, "History")
-        
-        layout.addWidget(self.info_tabs)
-        
-        return panel
+        self.history_tab = self.notebook.add("History")
+        self.create_history_section()
     
-    def setup_menu_bar(self):
-        """Setup the application menu bar"""
-        menubar = self.menuBar()
+    def create_preview_section(self):
+        """Create content preview section"""
+        self.preview_tab.grid_columnconfigure(0, weight=1)
         
-        # File menu
-        file_menu = menubar.addMenu("File")
+        # Preview frame (initially hidden)
+        self.preview_frame = ctk.CTkFrame(self.preview_tab)
         
-        settings_action = QAction("Settings", self)
-        settings_action.setShortcut("Ctrl+,")
-        settings_action.triggered.connect(self.open_settings)
-        file_menu.addAction(settings_action)
+        # No content message
+        self.no_content_frame = ctk.CTkFrame(self.preview_tab)
+        self.no_content_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
+        self.no_content_frame.grid_columnconfigure(0, weight=1)
+        self.no_content_frame.grid_rowconfigure(0, weight=1)
         
-        file_menu.addSeparator()
-        
-        exit_action = QAction("Exit", self)
-        exit_action.setShortcut("Ctrl+Q")
-        exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
-        
-        # Help menu
-        help_menu = menubar.addMenu("Help")
-        
-        about_action = QAction("About", self)
-        about_action.triggered.connect(self.show_about)
-        help_menu.addAction(about_action)
+        no_content_label = ctk.CTkLabel(
+            self.no_content_frame,
+            text="🔗 Paste a URL above to get started",
+            font=ctk.CTkFont(size=16),
+            text_color=("gray50", "gray50")
+        )
+        no_content_label.grid(row=0, column=0)
     
-    def setup_system_tray(self):
-        """Setup system tray icon"""
+    def create_queue_section(self):
+        """Create download queue section"""
+        self.queue_tab.grid_columnconfigure(0, weight=1)
+        self.queue_tab.grid_rowconfigure(0, weight=1)
+        
+        # Scrollable frame for queue items
+        self.queue_scroll = ctk.CTkScrollableFrame(self.queue_tab)
+        self.queue_scroll.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.queue_scroll.grid_columnconfigure(0, weight=1)
+        
+        # Empty queue message
+        self.empty_queue_label = ctk.CTkLabel(
+            self.queue_scroll,
+            text="📥 No downloads in queue",
+            font=ctk.CTkFont(size=14),
+            text_color=("gray50", "gray50")
+        )
+        self.empty_queue_label.grid(row=0, column=0, pady=20)
+    
+    def create_history_section(self):
+        """Create download history section"""
+        self.history_tab.grid_columnconfigure(0, weight=1)
+        self.history_tab.grid_rowconfigure(0, weight=1)
+        
+        # Scrollable frame for history items
+        self.history_scroll = ctk.CTkScrollableFrame(self.history_tab)
+        self.history_scroll.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.history_scroll.grid_columnconfigure(0, weight=1)
+        
+        # Empty history message
+        self.empty_history_label = ctk.CTkLabel(
+            self.history_scroll,
+            text="📋 No download history",
+            font=ctk.CTkFont(size=14),
+            text_color=("gray50", "gray50")
+        )
+        self.empty_history_label.grid(row=0, column=0, pady=20)
+    
+    def create_action_buttons(self):
+        """Create action buttons"""
+        button_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        button_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 10))
+        button_frame.grid_columnconfigure(2, weight=1)
+        
+        # Add to queue button
+        self.add_queue_button = ctk.CTkButton(
+            button_frame,
+            text="➕ Add to Queue",
+            width=120,
+            height=36,
+            command=self.add_to_queue,
+            state="disabled"
+        )
+        self.add_queue_button.grid(row=0, column=0, padx=(0, 10))
+        
+        # Download all button
+        self.download_all_button = ctk.CTkButton(
+            button_frame,
+            text="⬇️ Download All",
+            width=120,
+            height=36,
+            command=self.start_downloads,
+            state="disabled"
+        )
+        self.download_all_button.grid(row=0, column=1, padx=(0, 10))
+        
+        # Open folder button
+        open_folder_button = ctk.CTkButton(
+            button_frame,
+            text="📁 Open Folder",
+            width=120,
+            height=36,
+            command=self.open_download_folder
+        )
+        open_folder_button.grid(row=0, column=3)
+    
+    def create_status_bar(self):
+        """Create status bar"""
+        self.status_frame = ctk.CTkFrame(self.root, height=30, corner_radius=0)
+        self.status_frame.grid(row=4, column=0, sticky="ew")
+        self.status_frame.grid_columnconfigure(0, weight=1)
+        
+        self.status_label = ctk.CTkLabel(
+            self.status_frame,
+            text="Ready",
+            font=ctk.CTkFont(size=11)
+        )
+        self.status_label.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+    
+    def paste_url(self, event=None):
+        """Paste URL from clipboard"""
         try:
-            if QSystemTrayIcon.isSystemTrayAvailable():
-                self.tray_icon = QSystemTrayIcon(self)
-                self.tray_icon.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_MediaPlay))
-                
-                tray_menu = QMenu()
-                show_action = tray_menu.addAction("Show")
-                show_action.triggered.connect(self.show)
-                quit_action = tray_menu.addAction("Quit")
-                quit_action.triggered.connect(self.close)
-                
-                self.tray_icon.setContextMenu(tray_menu)
-                self.tray_icon.show()
+            clipboard_text = self.root.clipboard_get()
+            if clipboard_text and self.is_valid_url(clipboard_text):
+                self.url_entry.delete(0, 'end')
+                self.url_entry.insert(0, clipboard_text)
+                # Auto-analyze if it looks like a supported URL
+                self.analyze_url()
+            else:
+                self.set_status("No valid URL found in clipboard")
         except Exception as e:
-            print(f"System tray setup failed: {e}")
-    
-    def center_window(self):
-        """Center the window on the screen"""
-        try:
-            screen = QApplication.primaryScreen()
-            if screen:
-                screen_geometry = screen.geometry()
-                window_geometry = self.geometry()
-                x = (screen_geometry.width() - window_geometry.width()) // 2
-                y = (screen_geometry.height() - window_geometry.height()) // 2
-                self.move(x, y)
-        except Exception as e:
-            print(f"Window centering failed: {e}")
-    
-    def apply_modern_style(self):
-        """Apply modern styling to the application"""
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #F5F5F5;
-            }
-            QGroupBox {
-                font-weight: bold;
-                border: 2px solid #CCCCCC;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 10px;
-                background-color: white;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-                background-color: white;
-            }
-            QTabWidget::pane {
-                border: 1px solid #C0C0C0;
-                background-color: white;
-                border-radius: 4px;
-            }
-            QTabBar::tab {
-                background-color: #E0E0E0;
-                padding: 8px 16px;
-                margin-right: 2px;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-            }
-            QTabBar::tab:selected {
-                background-color: white;
-                border-bottom: 2px solid #4A90E2;
-            }
-            QTableWidget {
-                gridline-color: #E0E0E0;
-                background-color: white;
-                border: 1px solid #CCCCCC;
-                border-radius: 4px;
-            }
-            QListWidget {
-                border: 1px solid #CCCCCC;
-                border-radius: 4px;
-                background-color: white;
-            }
-            QProgressBar {
-                border: 2px solid #CCCCCC;
-                border-radius: 8px;
-                text-align: center;
-                background-color: #F0F0F0;
-            }
-            QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4A90E2, stop:1 #357ABD);
-                border-radius: 6px;
-            }
-        """)
-    
-    def on_url_changed(self, text):
-        """Handle URL input changes"""
-        self.download_btn.setEnabled(bool(text.strip()))
-        if text.strip():
-            # Auto-detect media type and update UI
-            self.detect_media_type(text)
-            # Extract info if valid URL
-            if self.is_valid_url(text.strip()):
-                self.media_info.extract_info(text.strip())
+            self.set_status("Could not access clipboard")
     
     def is_valid_url(self, url):
-        """Basic URL validation"""
+        """Check if URL is valid"""
         try:
             result = urllib.parse.urlparse(url)
             return all([result.scheme, result.netloc])
-        except Exception:
+        except:
             return False
     
-    def on_type_changed(self, type_text):
-        """Handle format type changes"""
-        self.update_quality_options(type_text)
-    
-    def update_quality_options(self, media_type):
-        """Update quality options based on media type"""
-        self.quality_combo.clear()
-        if media_type == "Video":
-            self.quality_combo.addItems([
-                "Best Available", "2160p (4K)", "1440p (2K)", 
-                "1080p", "720p", "480p", "360p", "240p", "144p"
-            ])
-        elif media_type == "Audio":
-            self.quality_combo.addItems([
-                "320 kbps", "192 kbps", "128 kbps", "64 kbps"
-            ])
-        else:  # Auto-detect
-            self.quality_combo.addItems(["Best Available", "720p", "320 kbps"])
-    
-    def detect_media_type(self, url):
-        """Auto-detect media type from URL"""
-        # Simple URL pattern matching for auto-detection
-        url_lower = url.lower()
-        if any(platform in url_lower for platform in ['youtube.com', 'youtu.be', 'vimeo.com']):
-            self.type_combo.setCurrentText("Video")
-        elif any(platform in url_lower for platform in ['soundcloud.com', 'spotify.com']):
-            self.type_combo.setCurrentText("Audio")
-        else:
-            self.type_combo.setCurrentText("Auto-detect")
-    
-    def paste_from_clipboard(self):
-        """Paste URL from clipboard"""
-        try:
-            clipboard = QApplication.clipboard()
-            text = clipboard.text()
-            if text:
-                self.url_input.setText(text.strip())
-        except Exception as e:
-            print(f"Clipboard paste failed: {e}")
-    
-    def browse_download_location(self):
-        """Browse for download location"""
-        try:
-            path = QFileDialog.getExistingDirectory(self, "Select Download Directory")
-            if path:
-                self.path_label.setText(Path(path).name)
-                settings = QSettings("SocialMediaDownloader", "Settings")
-                settings.setValue("download_path", path)
-        except Exception as e:
-            print(f"Browse directory failed: {e}")
-    
-    def add_to_queue(self):
-        """Add current URL to download queue"""
-        url = self.url_input.text().strip()
-        if url and self.is_valid_url(url):
-            item_text = f"{url} ({self.type_combo.currentText()} - {self.quality_combo.currentText()})"
-            self.queue_list.addItem(item_text)
-            self.url_input.clear()
-        else:
-            QMessageBox.warning(self, "Invalid URL", "Please enter a valid URL")
-    
-    def clear_queue(self):
-        """Clear download queue"""
-        self.queue_list.clear()
-    
-    def start_download(self):
-        """Start the download process"""
-        url = self.url_input.text().strip()
+    def analyze_url(self):
+        """Analyze the URL and show preview"""
+        url = self.url_entry.get().strip()
         if not url:
             return
         
         if not self.is_valid_url(url):
-            QMessageBox.warning(self, "Invalid URL", "Please enter a valid URL")
+            messagebox.showerror("Invalid URL", "Please enter a valid URL")
             return
         
-        # Get download settings
-        settings = QSettings("SocialMediaDownloader", "Settings")
-        download_path = settings.value("download_path", str(Path.home() / "Downloads"))
+        self.set_status("Analyzing URL...")
+        self.analyze_button.configure(state="disabled", text="⏳ Analyzing...")
         
-        # Ensure download directory exists
+        # Run analysis in background thread
+        thread = threading.Thread(target=self._analyze_url_thread, args=(url,))
+        thread.daemon = True
+        thread.start()
+    
+    def _analyze_url_thread(self, url):
+        """Background thread for URL analysis"""
         try:
-            os.makedirs(download_path, exist_ok=True)
+            info = self.ytdl.get_video_info(url)
+            
+            # Update UI in main thread
+            self.root.after(0, self._show_preview, url, info)
+            
         except Exception as e:
-            QMessageBox.critical(self, "Directory Error", f"Cannot create download directory: {e}")
+            error_msg = str(e)
+            self.root.after(0, self._show_error, f"Error analyzing URL: {error_msg}")
+    
+    def _show_preview(self, url, info):
+        """Show content preview"""
+        self.analyze_button.configure(state="normal", text="🔍 Analyze")
+        
+        # Hide no content message
+        self.no_content_frame.grid_remove()
+        
+        # Create preview content
+        self.preview_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
+        self.preview_frame.grid_columnconfigure(1, weight=1)
+        
+        # Clear previous content
+        for widget in self.preview_frame.winfo_children():
+            widget.destroy()
+        
+        # Thumbnail
+        thumbnail_frame = ctk.CTkFrame(self.preview_frame, width=140, height=105)
+        thumbnail_frame.grid(row=0, column=0, rowspan=4, padx=20, pady=20, sticky="nw")
+        thumbnail_frame.grid_propagate(False)
+        
+        # Try to load thumbnail
+        if info.get('thumbnail'):
+            thumbnail = self.thumbnail_cache.get_thumbnail(info['thumbnail'])
+            if thumbnail:
+                thumbnail_label = ctk.CTkLabel(thumbnail_frame, image=thumbnail, text="")
+                thumbnail_label.grid(row=0, column=0, padx=10, pady=10)
+            else:
+                placeholder_label = ctk.CTkLabel(thumbnail_frame, text="🖼️\nThumbnail", font=ctk.CTkFont(size=12))
+                placeholder_label.grid(row=0, column=0, padx=10, pady=10)
+        else:
+            placeholder_label = ctk.CTkLabel(thumbnail_frame, text="🖼️\nNo Preview", font=ctk.CTkFont(size=12))
+            placeholder_label.grid(row=0, column=0, padx=10, pady=10)
+        
+        # Content info
+        info_frame = ctk.CTkFrame(self.preview_frame, fg_color="transparent")
+        info_frame.grid(row=0, column=1, sticky="ew", padx=20, pady=20)
+        info_frame.grid_columnconfigure(1, weight=1)
+        
+        # Title
+        ctk.CTkLabel(info_frame, text="Title:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", pady=2)
+        title_label = ctk.CTkLabel(info_frame, text=info['title'][:60] + "..." if len(info['title']) > 60 else info['title'])
+        title_label.grid(row=0, column=1, sticky="w", padx=(10, 0), pady=2)
+        
+        # Platform
+        ctk.CTkLabel(info_frame, text="Platform:", font=ctk.CTkFont(weight="bold")).grid(row=1, column=0, sticky="w", pady=2)
+        ctk.CTkLabel(info_frame, text=info['platform']).grid(row=1, column=1, sticky="w", padx=(10, 0), pady=2)
+        
+        # Duration
+        if info['duration'] != "N/A":
+            ctk.CTkLabel(info_frame, text="Duration:", font=ctk.CTkFont(weight="bold")).grid(row=2, column=0, sticky="w", pady=2)
+            ctk.CTkLabel(info_frame, text=info['duration']).grid(row=2, column=1, sticky="w", padx=(10, 0), pady=2)
+        
+        # Quality and format selection
+        options_frame = ctk.CTkFrame(self.preview_frame, fg_color="transparent")
+        options_frame.grid(row=1, column=1, sticky="ew", padx=20, pady=(0, 20))
+        options_frame.grid_columnconfigure((0, 2), weight=1)
+        
+        # Format selection
+        ctk.CTkLabel(options_frame, text="Format:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", pady=5)
+        self.format_var = ctk.StringVar(value="mp4")
+        format_menu = ctk.CTkOptionMenu(
+            options_frame,
+            variable=self.format_var,
+            values=["mp4", "mp3"],
+            command=self.on_format_change
+        )
+        format_menu.grid(row=0, column=1, padx=10, pady=5, sticky="ew")
+        
+        # Quality selection
+        ctk.CTkLabel(options_frame, text="Quality:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=2, sticky="w", pady=5)
+        self.quality_var = ctk.StringVar(value="720p")
+        
+        # Populate quality options based on available formats
+        video_qualities = [f['quality'] for f in info['formats']['video']] if info['formats']['video'] else ["720p", "480p", "360p"]
+        if not video_qualities:
+            video_qualities = ["720p", "480p", "360p"]
+        
+        self.quality_menu = ctk.CTkOptionMenu(
+            options_frame,
+            variable=self.quality_var,
+            values=video_qualities
+        )
+        self.quality_menu.grid(row=0, column=3, padx=10, pady=5, sticky="ew")
+        
+        # Store current info for download
+        self.current_info = {
+            'url': url,
+            'title': info['title'],
+            'platform': info['platform'],
+            'thumbnail': info.get('thumbnail', ''),
+            'duration': info['duration'],
+            'formats': info['formats']
+        }
+        
+        self.add_queue_button.configure(state="normal")
+        self.set_status(f"Ready to download: {info['title']}")
+    
+    def on_format_change(self, format_type):
+        """Handle format change"""
+        if not hasattr(self, 'current_info'):
             return
         
-        # Determine format type and quality
-        format_type = self.type_combo.currentText().lower()
-        if format_type == "auto-detect":
-            format_type = "video"  # Default to video for auto-detect
+        if format_type == "mp3":
+            # Switch to audio qualities
+            audio_qualities = ["320kbps", "256kbps", "192kbps", "128kbps"]
+            self.quality_menu.configure(values=audio_qualities)
+            self.quality_var.set("192kbps")
+        else:
+            # Switch to video qualities
+            video_qualities = [f['quality'] for f in self.current_info['formats']['video']] if self.current_info['formats']['video'] else ["720p", "480p", "360p"]
+            if not video_qualities:
+                video_qualities = ["720p", "480p", "360p"]
+            self.quality_menu.configure(values=video_qualities)
+            self.quality_var.set("720p")
+    
+    def _show_error(self, error_msg):
+        """Show error message"""
+        self.analyze_button.configure(state="normal", text="🔍 Analyze")
+        self.set_status(error_msg)
+        messagebox.showerror("Error", error_msg)
+    
+    def add_to_queue(self):
+        """Add current item to download queue"""
+        if not hasattr(self, 'current_info'):
+            return
         
-        # Add to download manager
+        item = DownloadItem(
+            url=self.current_info['url'],
+            title=self.current_info['title'],
+            platform=self.current_info['platform'],
+            thumbnail_url=self.current_info['thumbnail'],
+            duration=self.current_info['duration'],
+            quality=self.quality_var.get(),
+            format_type=self.format_var.get()
+        )
+        
+        self.download_items.append(item)
+        self.update_queue_display()
+        self.download_all_button.configure(state="normal")
+        
+        # Clear current preview
+        self.preview_frame.grid_remove()
+        self.no_content_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
+        self.add_queue_button.configure(state="disabled")
+        self.url_entry.delete(0, 'end')
+        
+        self.set_status(f"Added to queue: {item.title}")
+    
+    def update_queue_display(self):
+        """Update the queue display"""
+        # Clear existing items
+        for widget in self.queue_scroll.winfo_children():
+            widget.destroy()
+        
+        if not self.download_items:
+            self.empty_queue_label = ctk.CTkLabel(
+                self.queue_scroll,
+                text="📥 No downloads in queue",
+                font=ctk.CTkFont(size=14),
+                text_color=("gray50", "gray50")
+            )
+            self.empty_queue_label.grid(row=0, column=0, pady=20)
+            return
+        
+        # Add queue items
+        for i, item in enumerate(self.download_items):
+            self.create_queue_item(i, item)
+    
+    def create_queue_item(self, index, item):
+        """Create a queue item widget"""
+        item_frame = ctk.CTkFrame(self.queue_scroll)
+        item_frame.grid(row=index, column=0, sticky="ew", padx=10, pady=5)
+        item_frame.grid_columnconfigure(1, weight=1)
+        
+        # Status indicator
+        status_colors = {
+            'pending': ("gray50", "gray50"),
+            'downloading': ("#007acc", "#4da6ff"),
+            'completed': ("#28a745", "#20c997"),
+            'error': ("#dc3545", "#e74c3c")
+        }
+        
+        status_icons = {
+            'pending': '⏳',
+            'downloading': '⬇️',
+            'completed': '✅',
+            'error': '❌'
+        }
+        
+        status_label = ctk.CTkLabel(
+            item_frame,
+            text=status_icons.get(item.status, '?'),
+            font=ctk.CTkFont(size=16),
+            text_color=status_colors.get(item.status, ("gray50", "gray50"))
+        )
+        status_label.grid(row=0, column=0, padx=10, pady=10)
+        
+        # Content info
+        info_frame = ctk.CTkFrame(item_frame, fg_color="transparent")
+        info_frame.grid(row=0, column=1, sticky="ew", padx=10, pady=10)
+        info_frame.grid_columnconfigure(0, weight=1)
+        
+        # Title and platform
+        title_text = item.title[:50] + "..." if len(item.title) > 50 else item.title
+        title_label = ctk.CTkLabel(
+            info_frame,
+            text=f"{title_text} ({item.platform})",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w"
+        )
+        title_label.grid(row=0, column=0, sticky="ew")
+        
+        # Format and quality info
+        format_info = f"{item.format_type.upper()} • {item.quality}"
+        if item.duration and item.duration != "N/A":
+            format_info += f" • {item.duration}"
+        
+        format_label = ctk.CTkLabel(
+            info_frame,
+            text=format_info,
+            font=ctk.CTkFont(size=10),
+            text_color=("gray60", "gray40"),
+            anchor="w"
+        )
+        format_label.grid(row=1, column=0, sticky="ew")
+        
+        # Progress bar (if downloading)
+        if item.status == 'downloading':
+            progress_bar = ctk.CTkProgressBar(info_frame, height=8)
+            progress_bar.grid(row=2, column=0, sticky="ew", pady=(5, 0))
+            progress_bar.set(item.progress / 100.0)
+        
+        # Error message (if error)
+        if item.status == 'error' and item.error_message:
+            error_label = ctk.CTkLabel(
+                info_frame,
+                text=f"Error: {item.error_message[:30]}...",
+                font=ctk.CTkFont(size=10),
+                text_color=status_colors['error'],
+                anchor="w"
+            )
+            error_label.grid(row=2, column=0, sticky="ew")
+        
+        # Remove button
+        remove_button = ctk.CTkButton(
+            item_frame,
+            text="🗑️",
+            width=30,
+            height=30,
+            font=ctk.CTkFont(size=12),
+            command=lambda: self.remove_from_queue(index)
+        )
+        remove_button.grid(row=0, column=2, padx=10, pady=10)
+    
+    def remove_from_queue(self, index):
+        """Remove item from queue"""
+        if 0 <= index < len(self.download_items):
+            item = self.download_items[index]
+            if item.status != 'downloading':
+                self.download_items.pop(index)
+                self.update_queue_display()
+                
+                if not self.download_items:
+                    self.download_all_button.configure(state="disabled")
+                
+                self.set_status(f"Removed from queue: {item.title}")
+            else:
+                messagebox.showwarning("Cannot Remove", "Cannot remove item while downloading")
+    
+    def start_downloads(self):
+        """Start downloading all queued items"""
+        pending_items = [item for item in self.download_items if item.status == 'pending']
+        
+        if not pending_items:
+            messagebox.showinfo("No Downloads", "No pending downloads in queue")
+            return
+        
+        # Add items to download queue
+        for item in pending_items:
+            self.download_queue.put(item)
+        
+        self.set_status(f"Starting download of {len(pending_items)} items...")
+    
+    def download_worker(self):
+        """Background worker for downloads"""
+        while True:
+            try:
+                # Get item from queue
+                item = self.download_queue.get(timeout=1)
+                
+                if len(self.active_downloads) >= self.config.config['max_concurrent']:
+                    # Put back and wait
+                    self.download_queue.put(item)
+                    time.sleep(1)
+                    continue
+                
+                # Start download in separate thread
+                download_thread = threading.Thread(
+                    target=self.download_item,
+                    args=(item,)
+                )
+                download_thread.daemon = True
+                self.active_downloads[item] = download_thread
+                download_thread.start()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Error in download worker: {e}")
+    
+    def download_item(self, item):
+        """Download a single item"""
         try:
-            download_id = self.download_manager.add_download(
-                url=url,
-                format_type=format_type,
-                quality=self.quality_combo.currentText(),
-                output_path=download_path
+            # Update status
+            item.status = 'downloading'
+            self.root.after(0, self.update_queue_display)
+            
+            # Prepare download path
+            download_path = Path(self.config.config['download_path'])
+            download_path.mkdir(parents=True, exist_ok=True)
+            
+            if self.config.config['create_subfolders']:
+                platform_path = download_path / item.platform.lower()
+                platform_path.mkdir(exist_ok=True)
+                download_path = platform_path
+            
+            # Prepare yt-dlp command
+            safe_title = re.sub(r'[<>:"/\\|?*]', '', item.title)
+            filename = f"{safe_title}.%(ext)s"
+            
+            cmd = [
+                'yt-dlp',
+                '--no-playlist',
+                '-o', str(download_path / filename),
+                '--progress-template', '%(progress._percent_str)s',
+                item.url
+            ]
+            
+            # Add format selection
+            if item.format_type == 'mp3':
+                cmd.extend([
+                    '-x',
+                    '--audio-format', 'mp3',
+                    '--audio-quality', item.quality.replace('kbps', '')
+                ])
+            else:
+                # Video format
+                quality_num = item.quality.replace('p', '')
+                cmd.extend([
+                    '-f', f'best[height<={quality_num}]/best'
+                ])
+            
+            # Start download process
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                universal_newlines=True
             )
             
+            # Monitor progress
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    break
+                
+                # Parse progress
+                if '%' in line:
+                    try:
+                        progress_str = line.strip().replace('%', '')
+                        if progress_str.replace('.', '').isdigit():
+                            progress = float(progress_str)
+                            item.progress = min(progress, 100)
+                            self.root.after(0, self.update_queue_display)
+                    except:
+                        pass
+            
+            # Wait for process to complete
+            return_code = process.wait()
+            
+            if return_code == 0:
+                item.status = 'completed'
+                item.progress = 100
+                
+                # Find downloaded file
+                for file_path in download_path.glob(f"{safe_title}.*"):
+                    item.file_path = str(file_path)
+                    break
+                
+                self.root.after(0, lambda: self.set_status(f"Download completed: {item.title}"))
+            else:
+                stderr = process.stderr.read()
+                item.status = 'error'
+                item.error_message = stderr[:100] if stderr else "Download failed"
+                self.root.after(0, lambda: self.set_status(f"Download failed: {item.title}"))
+        
+        except Exception as e:
+            item.status = 'error'
+            item.error_message = str(e)
+            self.root.after(0, lambda: self.set_status(f"Error downloading {item.title}: {str(e)}"))
+        
+        finally:
+            # Remove from active downloads
+            if item in self.active_downloads:
+                del self.active_downloads[item]
+            
             # Update UI
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-            self.download_btn.setText("Cancel")
-            self.download_btn.clicked.disconnect()
-            self.download_btn.clicked.connect(lambda: self.cancel_download(download_id))
-            self.statusBar().showMessage("Download started...")
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Download Error", f"Failed to start download: {e}")
+            self.root.after(0, self.update_queue_display)
     
-    def cancel_download(self, download_id):
-        """Cancel current download"""
-        try:
-            self.download_manager.cancel_download(download_id)
-            self.reset_download_ui()
-            self.statusBar().showMessage("Download cancelled")
-        except Exception as e:
-            print(f"Cancel download error: {e}")
-    
-    def reset_download_ui(self):
-        """Reset download UI to initial state"""
-        self.progress_bar.setVisible(False)
-        self.download_btn.setText("Download")
-        self.download_btn.clicked.disconnect()
-        self.download_btn.clicked.connect(self.start_download)
-    
-    def on_download_completed(self, download_item):
-        """Handle download completion"""
-        self.reset_download_ui()
-        self.statusBar().showMessage("Download completed!")
+    def open_download_folder(self):
+        """Open the download folder"""
+        download_path = Path(self.config.config['download_path'])
+        download_path.mkdir(parents=True, exist_ok=True)
         
-        # Show notification
-        if hasattr(self, 'tray_icon') and hasattr(self.tray_icon, 'showMessage'):
-            try:
-                self.tray_icon.showMessage("Download Complete", 
-                                         f"Downloaded: {download_item.title}", 
-                                         QSystemTrayIcon.MessageIcon.Information)
-            except Exception as e:
-                print(f"Notification error: {e}")
-        
-        # Update history
-        self.update_download_history(download_item)
-    
-    def on_download_failed(self, download_item):
-        """Handle download failure"""
-        self.reset_download_ui()
-        self.statusBar().showMessage("Download failed")
-        
-        error_msg = download_item.error_message or "Unknown error occurred"
-        QMessageBox.critical(self, "Download Error", f"Download failed: {error_msg}")
-    
-    def on_download_updated(self, download_item):
-        """Handle download progress updates"""
-        if download_item.progress > 0:
-            self.progress_bar.setValue(download_item.progress)
-            
-        # Update status with speed info
-        if download_item.speed > 0:
-            speed_mb = download_item.speed / (1024 * 1024)
-            self.statusBar().showMessage(f"Downloading... {download_item.progress}% - {speed_mb:.1f} MB/s")
-    
-    def update_download_history(self, download_item):
-        """Update the download history table"""
         try:
-            # Save to database
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                INSERT INTO downloads (url, title, file_path, download_date, file_size, format_type)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                download_item.url,
-                download_item.title,
-                download_item.filename,
-                download_item.completed_at,
-                download_item.file_size,
-                download_item.format_type
-            ))
-            self.conn.commit()
-            
-            # Refresh history table
-            self.load_download_history()
-            
+            if sys.platform == "win32":
+                os.startfile(download_path)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", download_path])
+            else:
+                subprocess.run(["xdg-open", download_path])
         except Exception as e:
-            print(f"Error updating history: {e}")
+            messagebox.showerror("Error", f"Could not open folder: {e}")
     
-    def load_download_history(self):
-        """Load download history from database"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('SELECT title, format_type, download_date, file_size FROM downloads ORDER BY id DESC LIMIT 100')
-            rows = cursor.fetchall()
-            
-            self.history_table.setRowCount(len(rows))
-            for row_idx, row in enumerate(rows):
-                title, format_type, date, size = row
-                
-                # Format the data
-                title = title[:50] + "..." if title and len(title) > 50 else (title or "Unknown")
-                format_type = format_type or "Unknown"
-                
-                # Format date
-                try:
-                    if date:
-                        date_obj = datetime.fromisoformat(date.replace('Z', '+00:00'))
-                        formatted_date = date_obj.strftime("%Y-%m-%d %H:%M")
-                    else:
-                        formatted_date = "Unknown"
-                except Exception:
-                    formatted_date = date or "Unknown"
-                
-                # Format file size
-                if size and size > 0:
-                    if size > 1024 * 1024:
-                        size_str = f"{size / (1024 * 1024):.1f} MB"
-                    else:
-                        size_str = f"{size / 1024:.1f} KB"
-                else:
-                    size_str = "Unknown"
-                
-                # Add to table
-                self.history_table.setItem(row_idx, 0, QTableWidgetItem(title))
-                self.history_table.setItem(row_idx, 1, QTableWidgetItem(format_type))
-                self.history_table.setItem(row_idx, 2, QTableWidgetItem(formatted_date))
-                self.history_table.setItem(row_idx, 3, QTableWidgetItem(size_str))
-                
-        except Exception as e:
-            print(f"Error loading history: {e}")
+    def toggle_theme(self):
+        """Toggle between light and dark theme"""
+        current_mode = ctk.get_appearance_mode()
+        new_mode = "light" if current_mode.lower() == "dark" else "dark"
+        
+        ctk.set_appearance_mode(new_mode)
+        self.config.config['theme'] = new_mode
+        self.config.save_config()
+        
+        self.set_status(f"Switched to {new_mode} theme")
     
     def open_settings(self):
-        """Open settings dialog"""
-        try:
-            dialog = SettingsDialog(self)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                dialog.save_settings()
-                self.load_settings()
-        except Exception as e:
-            print(f"Settings dialog error: {e}")
+        """Open settings window"""
+        settings_window = SettingsWindow(self)
     
-    def load_settings(self):
-        """Load application settings"""
-        try:
-            settings = QSettings("SocialMediaDownloader", "Settings")
-            download_path = settings.value("download_path", str(Path.home() / "Downloads"))
-            self.path_label.setText(Path(download_path).name)
-            
-            # Load theme settings
-            theme = settings.value("theme", "Light")
-            self.apply_theme(theme)
-            
-            # Load default quality settings
-            video_quality = settings.value("video_quality", "720p")
-            audio_quality = settings.value("audio_quality", "320 kbps")
-            
-            # Apply to combo boxes if they match
-            if video_quality in [self.quality_combo.itemText(i) for i in range(self.quality_combo.count())]:
-                self.quality_combo.setCurrentText(video_quality)
-                
-        except Exception as e:
-            print(f"Error loading settings: {e}")
+    def set_status(self, message):
+        """Set status bar message"""
+        self.status_label.configure(text=message)
+        # Auto-clear status after 5 seconds
+        self.root.after(5000, lambda: self.status_label.configure(text="Ready"))
     
-    def apply_theme(self, theme):
-        """Apply the selected theme"""
-        if theme == "Dark":
-            self.setStyleSheet(self.get_dark_stylesheet())
-        else:
-            self.apply_modern_style()  # Light theme
-    
-    def get_dark_stylesheet(self):
-        """Get dark theme stylesheet"""
-        return """
-            QMainWindow {
-                background-color: #2B2B2B;
-                color: #FFFFFF;
-            }
-            QWidget {
-                background-color: #2B2B2B;
-                color: #FFFFFF;
-            }
-            QGroupBox {
-                font-weight: bold;
-                border: 2px solid #555555;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 10px;
-                background-color: #3C3C3C;
-                color: #FFFFFF;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-                background-color: #3C3C3C;
-                color: #FFFFFF;
-            }
-            ModernLineEdit {
-                border: 2px solid #555555;
-                border-radius: 8px;
-                padding: 8px 12px;
-                font-size: 14px;
-                background: #3C3C3C;
-                color: #FFFFFF;
-            }
-            ModernLineEdit:focus {
-                border-color: #4A90E2;
-            }
-            QComboBox {
-                border: 2px solid #555555;
-                border-radius: 4px;
-                padding: 5px;
-                background-color: #3C3C3C;
-                color: #FFFFFF;
-            }
-            QComboBox::drop-down {
-                border: none;
-            }
-            QComboBox::down-arrow {
-                border: none;
-            }
-            QTableWidget {
-                gridline-color: #555555;
-                background-color: #3C3C3C;
-                border: 1px solid #555555;
-                border-radius: 4px;
-                color: #FFFFFF;
-            }
-            QListWidget {
-                border: 1px solid #555555;
-                border-radius: 4px;
-                background-color: #3C3C3C;
-                color: #FFFFFF;
-            }
-            QTabWidget::pane {
-                border: 1px solid #555555;
-                background-color: #3C3C3C;
-                border-radius: 4px;
-            }
-            QTabBar::tab {
-                background-color: #555555;
-                color: #FFFFFF;
-                padding: 8px 16px;
-                margin-right: 2px;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-            }
-            QTabBar::tab:selected {
-                background-color: #3C3C3C;
-                border-bottom: 2px solid #4A90E2;
-            }
-            QProgressBar {
-                border: 2px solid #555555;
-                border-radius: 8px;
-                text-align: center;
-                background-color: #3C3C3C;
-                color: #FFFFFF;
-            }
-            QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4A90E2, stop:1 #357ABD);
-                border-radius: 6px;
-            }
-        """
-    
-    def show_about(self):
-        """Show about dialog"""
-        QMessageBox.about(self, "About Social Media Downloader", 
-                         """
-                         <h3>Social Media Downloader v1.0</h3>
-                         <p>A modern, comprehensive social media content downloader</p>
-                         <p><b>Supported platforms:</b><br>
-                         YouTube, TikTok, Facebook, Instagram, Twitter, Reddit, SoundCloud, and more</p>
-                         <p><b>Features:</b><br>
-                         • Multiple format support (MP4, MP3, WAV, AAC)<br>
-                         • Batch downloads<br>
-                         • Resume & retry functionality<br>
-                         • Modern, customizable interface<br>
-                         • Download history tracking</p>
-                         <p>Built with Python, PyQt6, and yt-dlp</p>
-                         """)
-    
-    def closeEvent(self, event):
-        """Handle application close event"""
-        try:
-            if hasattr(self, 'tray_icon') and self.tray_icon.isVisible():
-                self.hide()
-                event.ignore()
-            else:
-                # Clean up
-                if hasattr(self, 'download_manager'):
-                    self.download_manager.close()
-                if hasattr(self, 'conn'):
-                    self.conn.close()
-                event.accept()
-        except Exception as e:
-            print(f"Close event error: {e}")
-            event.accept()
+    def run(self):
+        """Start the application"""
+        self.root.mainloop()
 
+class SettingsWindow:
+    """Settings window"""
+    
+    def __init__(self, parent):
+        self.parent = parent
+        self.config = parent.config
+        
+        # Create settings window
+        self.window = ctk.CTkToplevel(parent.root)
+        self.window.title("Settings")
+        self.window.geometry("600x500")
+        self.window.transient(parent.root)
+        self.window.grab_set()
+        
+        # Center the window
+        self.window.update_idletasks()
+        x = (self.window.winfo_screenwidth() // 2) - (600 // 2)
+        y = (self.window.winfo_screenheight() // 2) - (500 // 2)
+        self.window.geometry(f"600x500+{x}+{y}")
+        
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Setup settings UI"""
+        # Create tabview
+        tabview = ctk.CTkTabview(self.window)
+        tabview.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # General tab
+        general_tab = tabview.add("General")
+        self.setup_general_tab(general_tab)
+        
+        # Download tab
+        download_tab = tabview.add("Download")
+        self.setup_download_tab(download_tab)
+        
+        # Platforms tab
+        platforms_tab = tabview.add("Platforms")
+        self.setup_platforms_tab(platforms_tab)
+        
+        # Buttons
+        button_frame = ctk.CTkFrame(self.window, fg_color="transparent")
+        button_frame.pack(fill="x", padx=20, pady=(0, 20))
+        
+        ctk.CTkButton(
+            button_frame,
+            text="Cancel",
+            command=self.window.destroy
+        ).pack(side="right", padx=(10, 0))
+        
+        ctk.CTkButton(
+            button_frame,
+            text="Save",
+            command=self.save_settings
+        ).pack(side="right")
+    
+    def setup_general_tab(self, tab):
+        """Setup general settings tab"""
+        # Theme selection
+        theme_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        theme_frame.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(theme_frame, text="Theme:", font=ctk.CTkFont(weight="bold")).pack(anchor="w")
+        
+        self.theme_var = ctk.StringVar(value=self.config.config['theme'])
+        theme_menu = ctk.CTkOptionMenu(
+            theme_frame,
+            variable=self.theme_var,
+            values=["system", "light", "dark"]
+        )
+        theme_menu.pack(anchor="w", pady=(5, 0))
+        
+        # Download location
+        location_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        location_frame.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(location_frame, text="Download Location:", font=ctk.CTkFont(weight="bold")).pack(anchor="w")
+        
+        location_input_frame = ctk.CTkFrame(location_frame, fg_color="transparent")
+        location_input_frame.pack(fill="x", pady=(5, 0))
+        location_input_frame.grid_columnconfigure(0, weight=1)
+        
+        self.location_var = ctk.StringVar(value=self.config.config['download_path'])
+        location_entry = ctk.CTkEntry(location_input_frame, textvariable=self.location_var)
+        location_entry.pack(side="left", fill="x", expand=True)
+        
+        browse_button = ctk.CTkButton(
+            location_input_frame,
+            text="Browse",
+            width=80,
+            command=self.browse_download_location
+        )
+        browse_button.pack(side="right", padx=(10, 0))
+    
+    def setup_download_tab(self, tab):
+        """Setup download settings tab"""
+        # Default video quality
+        video_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        video_frame.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(video_frame, text="Default Video Quality:", font=ctk.CTkFont(weight="bold")).pack(anchor="w")
+        
+        self.video_quality_var = ctk.StringVar(value=self.config.config['default_video_quality'])
+        video_menu = ctk.CTkOptionMenu(
+            video_frame,
+            variable=self.video_quality_var,
+            values=["4K", "1080p", "720p", "480p", "360p", "240p", "144p"]
+        )
+        video_menu.pack(anchor="w", pady=(5, 0))
+        
+        # Default audio quality
+        audio_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        audio_frame.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(audio_frame, text="Default Audio Quality:", font=ctk.CTkFont(weight="bold")).pack(anchor="w")
+        
+        self.audio_quality_var = ctk.StringVar(value=self.config.config['default_audio_quality'])
+        audio_menu = ctk.CTkOptionMenu(
+            audio_frame,
+            variable=self.audio_quality_var,
+            values=["320kbps", "256kbps", "192kbps", "128kbps"]
+        )
+        audio_menu.pack(anchor="w", pady=(5, 0))
+        
+        # Max concurrent downloads
+        concurrent_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        concurrent_frame.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(concurrent_frame, text="Max Concurrent Downloads:", font=ctk.CTkFont(weight="bold")).pack(anchor="w")
+        
+        self.concurrent_var = ctk.StringVar(value=str(self.config.config['max_concurrent']))
+        concurrent_menu = ctk.CTkOptionMenu(
+            concurrent_frame,
+            variable=self.concurrent_var,
+            values=["1", "2", "3", "4", "5"]
+        )
+        concurrent_menu.pack(anchor="w", pady=(5, 0))
+        
+        # Create subfolders
+        self.subfolder_var = ctk.BooleanVar(value=self.config.config['create_subfolders'])
+        subfolder_check = ctk.CTkCheckBox(
+            tab,
+            text="Create platform subfolders",
+            variable=self.subfolder_var
+        )
+        subfolder_check.pack(anchor="w", padx=20, pady=10)
+    
+    def setup_platforms_tab(self, tab):
+        """Setup platforms settings tab"""
+        ctk.CTkLabel(
+            tab,
+            text="Enable/Disable Platform Support:",
+            font=ctk.CTkFont(weight="bold")
+        ).pack(anchor="w", padx=20, pady=(10, 20))
+        
+        self.platform_vars = {}
+        platforms = [
+            ("YouTube", "youtube"),
+            ("Instagram", "instagram"),
+            ("TikTok", "tiktok"),
+            ("Twitter/X", "twitter"),
+            ("Facebook", "facebook")
+        ]
+        
+        for display_name, key in platforms:
+            self.platform_vars[key] = ctk.BooleanVar(
+                value=self.config.config['platforms'].get(key, True)
+            )
+            
+            check = ctk.CTkCheckBox(
+                tab,
+                text=display_name,
+                variable=self.platform_vars[key]
+            )
+            check.pack(anchor="w", padx=40, pady=5)
+    
+    def browse_download_location(self):
+        """Browse for download location"""
+        folder = filedialog.askdirectory(
+            title="Select Download Location",
+            initialdir=self.location_var.get()
+        )
+        
+        if folder:
+            self.location_var.set(folder)
+    
+    def save_settings(self):
+        """Save settings and close window"""
+        # Update configuration
+        self.config.config['theme'] = self.theme_var.get()
+        self.config.config['download_path'] = self.location_var.get()
+        self.config.config['default_video_quality'] = self.video_quality_var.get()
+        self.config.config['default_audio_quality'] = self.audio_quality_var.get()
+        self.config.config['max_concurrent'] = int(self.concurrent_var.get())
+        self.config.config['create_subfolders'] = self.subfolder_var.get()
+        
+        # Update platform settings
+        for key, var in self.platform_vars.items():
+            self.config.config['platforms'][key] = var.get()
+        
+        # Save configuration
+        self.config.save_config()
+        
+        # Apply theme change
+        current_theme = ctk.get_appearance_mode()
+        new_theme = self.theme_var.get()
+        if current_theme.lower() != new_theme.lower() and new_theme != "system":
+            ctk.set_appearance_mode(new_theme)
+        elif new_theme == "system":
+            ctk.set_appearance_mode("system")
+        
+        self.parent.set_status("Settings saved successfully")
+        self.window.destroy()
 
-def main():
-    """Main application entry point"""
+def check_dependencies():
+    """Check if required dependencies are installed"""
+    missing = []
+    
     try:
-        app = QApplication(sys.argv)
-        app.setApplicationName("Social Media Downloader")
-        app.setApplicationVersion("1.0")
-        app.setOrganizationName("SocialDownloader")
-        
-        # Set application icon
-        app.setWindowIcon(app.style().standardIcon(app.style().StandardPixmap.SP_MediaPlay))
-        
-        # Create and show main window
-        window = SocialMediaDownloader()
-        window.show()
-        
-        # Start event loop
-        sys.exit(app.exec())
-        
-    except Exception as e:
-        print(f"Application startup error: {e}")
-        sys.exit(1)
-
+        import customtkinter
+    except ImportError:
+        missing.append("customtkinter")
+    
+    try:
+        import requests
+    except ImportError:
+        missing.append("requests")
+    
+    try:
+        from PIL import Image, ImageTk
+    except ImportError:
+        missing.append("Pillow")
+    
+    # Check yt-dlp
+    try:
+        result = subprocess.run(['yt-dlp', '--version'], capture_output=True)
+        if result.returncode != 0:
+            missing.append("yt-dlp")
+    except FileNotFoundError:
+        missing.append("yt-dlp")
+    
+    if missing:
+        print("Missing dependencies:")
+        for dep in missing:
+            print(f"  - {dep}")
+        print("\nInstall missing dependencies:")
+        if "yt-dlp" in missing:
+            print("  pip install yt-dlp")
+        python_deps = [dep for dep in missing if dep != "yt-dlp"]
+        if python_deps:
+            print(f"  pip install {' '.join(python_deps)}")
+        return False
+    
+    return True
 
 if __name__ == "__main__":
-    main()
+    # Check dependencies
+    if not check_dependencies():
+        print("\nPlease install missing dependencies and try again.")
+        sys.exit(1)
+    
+    try:
+        # Create and run application
+        app = SocialMediaDownloader()
+        app.run()
+    except KeyboardInterrupt:
+        print("\nApplication interrupted by user")
+    except Exception as e:
+        print(f"Application error: {e}")
+        import traceback
+        traceback.print_exc()
